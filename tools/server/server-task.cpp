@@ -87,6 +87,7 @@ json task_params::to_json(bool only_metrics) const {
             {"quantum_recv_timeout",      sampling.quantum_floor.recv_timeout_ms},
             {"quantum_log",               sampling.quantum_floor.log_path},
             {"quantum_debug_tax",         sampling.quantum_floor.debug_tax},
+            {"quantum_debug_samples",     sampling.quantum_floor.debug_samples},
             {"lora",                      lora},
         };
     }
@@ -151,6 +152,7 @@ json task_params::to_json(bool only_metrics) const {
         {"quantum_recv_timeout",      sampling.quantum_floor.recv_timeout_ms},
         {"quantum_log",               sampling.quantum_floor.log_path},
         {"quantum_debug_tax",         sampling.quantum_floor.debug_tax},
+        {"quantum_debug_samples",     sampling.quantum_floor.debug_samples},
         {"lora",                      lora},
     };
 }
@@ -324,6 +326,7 @@ task_params server_task::params_from_json_cmpl(
     params.sampling.quantum_floor.recv_timeout_ms = json_value(data, "quantum_recv_timeout", defaults.sampling.quantum_floor.recv_timeout_ms);
     params.sampling.quantum_floor.log_path        = json_value(data, "quantum_log",          defaults.sampling.quantum_floor.log_path);
     params.sampling.quantum_floor.debug_tax       = json_value(data, "quantum_debug_tax",    defaults.sampling.quantum_floor.debug_tax);
+    params.sampling.quantum_floor.debug_samples   = json_value(data, "quantum_debug_samples", defaults.sampling.quantum_floor.debug_samples);
     params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
 
     params.speculative = defaults.speculative;

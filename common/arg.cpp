@@ -1973,6 +1973,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--quantum-debug-samples"},
+        "log every quantum_floor sample source and QRNG word for auditing (default: disabled)",
+        [](common_params & params) {
+            params.sampling.quantum_floor.debug_samples = true;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {

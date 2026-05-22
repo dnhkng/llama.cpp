@@ -164,6 +164,8 @@ struct llama_sampler_quantum_floor {
     bool tax_logged = false;
     bool can_prefetch = false;
     std::future<uint32_t> prefetched_word;
+    uint64_t sample_index = 0;
+    uint64_t discarded_prefetches = 0;
 
     std::atomic<uint64_t> bytes_received{0};
     std::atomic<uint64_t> words_produced{0};
@@ -177,6 +179,11 @@ struct llama_sampler_quantum_floor {
 #ifndef _WIN32
     int sock = -1;
 #endif
+};
+
+struct quantum_floor_word {
+    uint32_t value;
+    bool from_prefetch;
 };
 
 static void quantum_floor_log(llama_sampler_quantum_floor * ctx, const char * level, const std::string & msg) {
@@ -389,14 +396,14 @@ static void quantum_floor_start_prefetch(llama_sampler_quantum_floor * ctx) {
 #endif
 }
 
-static uint32_t quantum_floor_next_word(llama_sampler_quantum_floor * ctx) {
+static quantum_floor_word quantum_floor_next_word(llama_sampler_quantum_floor * ctx) {
 #ifdef _WIN32
     throw std::runtime_error("quantum_floor: QRNG TCP sampler is not implemented on Windows");
 #else
     if (ctx->prefetched_word.valid()) {
-        return ctx->prefetched_word.get();
+        return { ctx->prefetched_word.get(), true };
     }
-    return quantum_floor_read_word(ctx);
+    return { quantum_floor_read_word(ctx), false };
 #endif
 }
 
@@ -415,7 +422,12 @@ static void llama_sampler_quantum_floor_reset(llama_sampler * smpl) {
     ctx->can_prefetch = false;
     if (ctx->prefetched_word.valid()) {
         try {
-            (void) ctx->prefetched_word.get();
+            const uint32_t discarded = ctx->prefetched_word.get();
+            ctx->discarded_prefetches++;
+            if (ctx->params.debug_samples) {
+                quantum_floor_log(ctx, "INFO", string_format("discarded prefetched QRNG word at reset raw=0x%08" PRIx32 " discarded=%" PRIu64,
+                            discarded, ctx->discarded_prefetches));
+            }
         } catch (const std::exception &) {
         }
     }
@@ -466,7 +478,8 @@ static void llama_sampler_quantum_floor_apply(llama_sampler * smpl, llama_token_
         }
     }
 
-    const uint32_t raw = quantum_floor_next_word(ctx);
+    const auto qword = quantum_floor_next_word(ctx);
+    const uint32_t raw = qword.value;
     ctx->can_prefetch = true;
     const uint32_t u = quantum_floor_spread(raw, ctx->rows);
 
@@ -517,6 +530,20 @@ static void llama_sampler_quantum_floor_apply(llama_sampler * smpl, llama_token_
     const auto alloc = quantum_floor_build_allocation(probs, (uint32_t) ctx->params.K);
     const auto it = std::upper_bound(alloc.cdf.begin(), alloc.cdf.end(), (uint64_t) u);
     cur_p->selected = it == alloc.cdf.end() ? cur_p->size - 1 : (int32_t) std::distance(alloc.cdf.begin(), it);
+    ctx->sample_index++;
+
+    if (ctx->params.debug_samples) {
+        quantum_floor_log(ctx, "INFO", string_format("sample=%" PRIu64 " source=%s raw=0x%08" PRIx32 " spread=0x%08" PRIx32
+                    " selected=%d token=%d bytes=%" PRIu64 " words=%" PRIu64,
+                    ctx->sample_index,
+                    qword.from_prefetch ? "prefetch" : "sync",
+                    raw,
+                    u,
+                    (int) cur_p->selected,
+                    cur_p->data[cur_p->selected].id,
+                    ctx->bytes_received.load(),
+                    ctx->words_produced.load()));
+    }
 }
 
 static llama_sampler * llama_sampler_quantum_floor_clone(const llama_sampler * smpl) {
@@ -561,6 +588,9 @@ static llama_sampler_i llama_sampler_quantum_floor_i = {
 llama_sampler * llama_sampler_init_quantum_floor(const quantum_floor_params & params, int32_t n_vocab) {
     if (params.qrng_host.empty()) {
         throw std::runtime_error("quantum_floor: qrng_host is empty");
+    }
+    if (!params.require_full_vocab) {
+        throw std::runtime_error("quantum_floor: require_full_vocab must be true");
     }
     if (params.qrng_port <= 0 || params.qrng_port > 65535) {
         throw std::runtime_error("quantum_floor: invalid QRNG port");

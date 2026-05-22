@@ -147,6 +147,16 @@ static void test_quantum_floor_k_validation() {
     quantum_floor_params params;
     params.qrng_host = "127.0.0.1";
 
+    params.K = 64;
+    params.require_full_vocab = false;
+    try {
+        llama_sampler_free(llama_sampler_init_quantum_floor(params, 10));
+        GGML_ABORT("quantum_floor require_full_vocab=false should fail");
+    } catch (const std::runtime_error & e) {
+        GGML_ASSERT(std::string(e.what()) == "quantum_floor: require_full_vocab must be true");
+    }
+
+    params.require_full_vocab = true;
     params.K = 0;
     try {
         llama_sampler_free(llama_sampler_init_quantum_floor(params, 10));

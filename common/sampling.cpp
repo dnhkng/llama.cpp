@@ -507,6 +507,9 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+    if (!gsmpl->params.quantum_floor.qrng_host.empty()) {
+        throw std::runtime_error("quantum_floor sampler does not support speculative cloning; disable speculative decoding");
+    }
     return new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),

@@ -14,6 +14,7 @@ struct quantum_floor_params {
     int         recv_timeout_ms = 2000;
     bool        require_full_vocab = true;
     bool        debug_tax = false;
+    bool        debug_samples = false;
     std::string log_path;
 };
 

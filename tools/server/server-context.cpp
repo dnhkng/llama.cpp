@@ -946,6 +946,15 @@ private:
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
         }
 
+        const bool use_quantum_floor = !params_base.sampling.quantum_floor.qrng_host.empty();
+        const bool has_speculative_types = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](auto type) {
+            return type != COMMON_SPECULATIVE_TYPE_NONE;
+        });
+        if (use_quantum_floor && (params_base.speculative.has_dft() || has_speculative_types)) {
+            SRV_WRN("%s", "quantum_floor sampler does not support speculative decoding; refusing to start");
+            throw std::runtime_error("quantum_floor sampler does not support speculative decoding; disable speculative types and draft models");
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
