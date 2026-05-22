@@ -9,17 +9,16 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
 #include <cctype>
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <thread>
 
 #include <cpp-httplib/httplib.h>
 #include <nlohmann/json.hpp>
@@ -162,21 +161,15 @@ struct llama_sampler_quantum_floor {
     int32_t n_vocab;
     std::vector<uint32_t> rows;
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::vector<uint32_t> ring;
-    size_t head = 0;
-    size_t count = 0;
-    bool stop = false;
-    std::string reader_error;
-    std::thread reader;
     bool tax_logged = false;
+    bool can_prefetch = false;
+    std::future<uint32_t> prefetched_word;
 
     std::atomic<uint64_t> bytes_received{0};
     std::atomic<uint64_t> words_produced{0};
-    std::atomic<uint64_t> buffer_drains{0};
     std::deque<uint8_t> bit_window;
     uint64_t bit_ones = 0;
+    std::chrono::steady_clock::time_point last_diag_log = std::chrono::steady_clock::now();
 
     std::mutex log_mutex;
     std::ofstream log_file;
@@ -280,27 +273,7 @@ static int quantum_floor_connect_tcp(const std::string & host, int port) {
     return fd;
 }
 
-static void quantum_floor_push_word(llama_sampler_quantum_floor * ctx, uint32_t word) {
-    {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        if (ctx->ring.empty()) {
-            return;
-        }
-        const size_t pos = (ctx->head + ctx->count) % ctx->ring.size();
-        if (ctx->count == ctx->ring.size()) {
-            ctx->ring[ctx->head] = word;
-            ctx->head = (ctx->head + 1) % ctx->ring.size();
-        } else {
-            ctx->ring[pos] = word;
-            ++ctx->count;
-        }
-    }
-    ctx->words_produced++;
-    ctx->cv.notify_one();
-}
-
 static void quantum_floor_note_byte(llama_sampler_quantum_floor * ctx, uint8_t byte) {
-    std::lock_guard<std::mutex> lock(ctx->mutex);
     for (int i = 0; i < 8; ++i) {
         const uint8_t bit = (byte >> i) & 1;
         ctx->bit_window.push_back(bit);
@@ -312,130 +285,140 @@ static void quantum_floor_note_byte(llama_sampler_quantum_floor * ctx, uint8_t b
     }
 }
 
-static void quantum_floor_reader_main(llama_sampler_quantum_floor * ctx) {
-    uint8_t bytes[4096];
-    uint8_t word_bytes[4] {};
-    int word_n = 0;
-    auto last_log = std::chrono::steady_clock::now();
+static void quantum_floor_log_diagnostics_if_due(llama_sampler_quantum_floor * ctx) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - ctx->last_diag_log < std::chrono::seconds(1)) {
+        return;
+    }
 
-    while (true) {
-        {
-            std::lock_guard<std::mutex> lock(ctx->mutex);
-            if (ctx->stop) {
-                break;
-            }
+    double mean = 0.0;
+    double lag1_corr = 0.0;
+    if (!ctx->bit_window.empty()) {
+        mean = (double) ctx->bit_ones / (double) ctx->bit_window.size();
+    }
+    if (ctx->bit_window.size() > 1) {
+        double xy = 0.0;
+        double x = 0.0;
+        double y = 0.0;
+        for (size_t i = 1; i < ctx->bit_window.size(); ++i) {
+            x += ctx->bit_window[i - 1];
+            y += ctx->bit_window[i];
+            xy += ctx->bit_window[i - 1] & ctx->bit_window[i];
+        }
+        const double n = (double) (ctx->bit_window.size() - 1);
+        const double mx = x / n;
+        const double my = y / n;
+        const double cov = xy / n - mx * my;
+        const double vx = mx * (1.0 - mx);
+        const double vy = my * (1.0 - my);
+        if (vx > 0.0 && vy > 0.0) {
+            lag1_corr = cov / std::sqrt(vx * vy);
+        }
+    }
+
+    quantum_floor_log(ctx, "INFO", string_format("bytes=%" PRIu64 " words=%" PRIu64 " mean=%.6f lag1_corr=%.6f",
+                ctx->bytes_received.load(), ctx->words_produced.load(), mean, lag1_corr));
+    ctx->last_diag_log = now;
+}
+
+static uint32_t quantum_floor_read_word(llama_sampler_quantum_floor * ctx) {
+    uint8_t bytes[4] {};
+    size_t n_read = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ctx->params.recv_timeout_ms);
+
+    while (n_read < sizeof(bytes)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            throw std::runtime_error("quantum_floor: timed out waiting for QRNG entropy");
         }
 
+        const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
         struct pollfd pfd {};
         pfd.fd = ctx->sock;
         pfd.events = POLLIN;
-        const int prc = poll(&pfd, 1, 250);
+
+        const int prc = poll(&pfd, 1, std::max<int>(1, (int) remaining_ms));
         if (prc < 0) {
-            std::lock_guard<std::mutex> lock(ctx->mutex);
-            ctx->reader_error = std::string("quantum_floor: poll failed: ") + strerror(errno);
-            ctx->cv.notify_all();
-            break;
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(std::string("quantum_floor: poll failed: ") + strerror(errno));
         }
         if (prc == 0) {
-            continue;
+            throw std::runtime_error("quantum_floor: timed out waiting for QRNG entropy");
         }
 
-        const ssize_t n = recv(ctx->sock, bytes, sizeof(bytes), 0);
-        if (n <= 0) {
-            std::lock_guard<std::mutex> lock(ctx->mutex);
-            ctx->reader_error = n == 0 ? "quantum_floor: QRNG socket closed" : std::string("quantum_floor: recv failed: ") + strerror(errno);
-            ctx->cv.notify_all();
-            break;
+        const ssize_t n = recv(ctx->sock, bytes + n_read, sizeof(bytes) - n_read, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(std::string("quantum_floor: recv failed: ") + strerror(errno));
+        }
+        if (n == 0) {
+            throw std::runtime_error("quantum_floor: QRNG socket closed");
         }
 
-        ctx->bytes_received += (uint64_t) n;
         for (ssize_t i = 0; i < n; ++i) {
-            quantum_floor_note_byte(ctx, bytes[i]);
-            word_bytes[word_n++] = bytes[i];
-            if (word_n == 4) {
-                const uint32_t word = ((uint32_t) word_bytes[3] << 24) | ((uint32_t) word_bytes[2] << 16) |
-                    ((uint32_t) word_bytes[1] << 8) | (uint32_t) word_bytes[0];
-                quantum_floor_push_word(ctx, word);
-                word_n = 0;
-            }
+            quantum_floor_note_byte(ctx, bytes[n_read + i]);
         }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_log >= std::chrono::seconds(1)) {
-            double mean = 0.0;
-            double lag1_corr = 0.0;
-            size_t fullness = 0;
-            size_t capacity = 0;
-            {
-                std::lock_guard<std::mutex> lock(ctx->mutex);
-                if (!ctx->bit_window.empty()) {
-                    mean = (double) ctx->bit_ones / (double) ctx->bit_window.size();
-                }
-                if (ctx->bit_window.size() > 1) {
-                    double xy = 0.0;
-                    double x = 0.0;
-                    double y = 0.0;
-                    for (size_t i = 1; i < ctx->bit_window.size(); ++i) {
-                        x += ctx->bit_window[i - 1];
-                        y += ctx->bit_window[i];
-                        xy += ctx->bit_window[i - 1] & ctx->bit_window[i];
-                    }
-                    const double n = (double) (ctx->bit_window.size() - 1);
-                    const double mx = x / n;
-                    const double my = y / n;
-                    const double cov = xy / n - mx * my;
-                    const double vx = mx * (1.0 - mx);
-                    const double vy = my * (1.0 - my);
-                    if (vx > 0.0 && vy > 0.0) {
-                        lag1_corr = cov / std::sqrt(vx * vy);
-                    }
-                }
-                fullness = ctx->count;
-                capacity = ctx->ring.size();
-            }
-            quantum_floor_log(ctx, "INFO", string_format("bytes=%" PRIu64 " words=%" PRIu64 " drains=%" PRIu64 " mean=%.6f lag1_corr=%.6f buffer=%zu/%zu",
-                        ctx->bytes_received.load(), ctx->words_produced.load(), ctx->buffer_drains.load(), mean, lag1_corr, fullness, capacity));
-            last_log = now;
-        }
+        n_read += (size_t) n;
+        ctx->bytes_received += (uint64_t) n;
     }
+
+    ctx->words_produced++;
+    quantum_floor_log_diagnostics_if_due(ctx);
+
+    const uint32_t word = ((uint32_t) bytes[3] << 24) | ((uint32_t) bytes[2] << 16) |
+        ((uint32_t) bytes[1] << 8) | (uint32_t) bytes[0];
+    return word;
 }
 #endif
 
-static uint32_t quantum_floor_pop_word(llama_sampler_quantum_floor * ctx) {
-    std::unique_lock<std::mutex> lock(ctx->mutex);
-    if (ctx->count == 0) {
-        ctx->buffer_drains++;
-        quantum_floor_log(ctx, "WARN", "entropy buffer drained; waiting for QRNG data");
+static void quantum_floor_start_prefetch(llama_sampler_quantum_floor * ctx) {
+#ifndef _WIN32
+    if (!ctx->can_prefetch || ctx->prefetched_word.valid()) {
+        return;
     }
 
-    const auto timeout = std::chrono::milliseconds(ctx->params.recv_timeout_ms);
-    const bool ready = ctx->cv.wait_for(lock, timeout, [&] {
-        return ctx->count > 0 || !ctx->reader_error.empty() || ctx->stop;
+    ctx->prefetched_word = std::async(std::launch::async, [ctx] {
+        return quantum_floor_read_word(ctx);
     });
+#else
+    (void) ctx;
+#endif
+}
 
-    if (!ready) {
-        throw std::runtime_error("quantum_floor: timed out waiting for QRNG entropy");
+static uint32_t quantum_floor_next_word(llama_sampler_quantum_floor * ctx) {
+#ifdef _WIN32
+    throw std::runtime_error("quantum_floor: QRNG TCP sampler is not implemented on Windows");
+#else
+    if (ctx->prefetched_word.valid()) {
+        return ctx->prefetched_word.get();
     }
-    if (!ctx->reader_error.empty()) {
-        throw std::runtime_error(ctx->reader_error);
-    }
-    if (ctx->count == 0) {
-        throw std::runtime_error("quantum_floor: stopped without entropy");
-    }
-
-    const uint32_t word = ctx->ring[ctx->head];
-    ctx->head = (ctx->head + 1) % ctx->ring.size();
-    --ctx->count;
-    return word;
+    return quantum_floor_read_word(ctx);
+#endif
 }
 
 static const char * llama_sampler_quantum_floor_name(const llama_sampler *) {
     return "quantum_floor";
 }
 
+static void llama_sampler_quantum_floor_accept(llama_sampler * smpl, llama_token) {
+    auto * ctx = (llama_sampler_quantum_floor *) smpl->ctx;
+    quantum_floor_start_prefetch(ctx);
+}
+
 static void llama_sampler_quantum_floor_reset(llama_sampler * smpl) {
     auto * ctx = (llama_sampler_quantum_floor *) smpl->ctx;
     ctx->tax_logged = false;
+    ctx->can_prefetch = false;
+    if (ctx->prefetched_word.valid()) {
+        try {
+            (void) ctx->prefetched_word.get();
+        } catch (const std::exception &) {
+        }
+    }
 }
 
 static void quantum_floor_log_tax(llama_sampler_quantum_floor * ctx, const std::vector<double> & probs) {
@@ -483,7 +466,8 @@ static void llama_sampler_quantum_floor_apply(llama_sampler * smpl, llama_token_
         }
     }
 
-    const uint32_t raw = quantum_floor_pop_word(ctx);
+    const uint32_t raw = quantum_floor_next_word(ctx);
+    ctx->can_prefetch = true;
     const uint32_t u = quantum_floor_spread(raw, ctx->rows);
 
     std::vector<double> probs(cur_p->size);
@@ -542,18 +526,16 @@ static llama_sampler * llama_sampler_quantum_floor_clone(const llama_sampler * s
 
 static void llama_sampler_quantum_floor_free(llama_sampler * smpl) {
     auto * ctx = (llama_sampler_quantum_floor *) smpl->ctx;
-    {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        ctx->stop = true;
-    }
-    ctx->cv.notify_all();
 #ifndef _WIN32
     if (ctx->sock != -1) {
         shutdown(ctx->sock, SHUT_RDWR);
     }
 #endif
-    if (ctx->reader.joinable()) {
-        ctx->reader.join();
+    if (ctx->prefetched_word.valid()) {
+        try {
+            (void) ctx->prefetched_word.get();
+        } catch (const std::exception &) {
+        }
     }
 #ifndef _WIN32
     if (ctx->sock != -1) {
@@ -565,7 +547,7 @@ static void llama_sampler_quantum_floor_free(llama_sampler * smpl) {
 
 static llama_sampler_i llama_sampler_quantum_floor_i = {
     /* .name              = */ llama_sampler_quantum_floor_name,
-    /* .accept            = */ nullptr,
+    /* .accept            = */ llama_sampler_quantum_floor_accept,
     /* .apply             = */ llama_sampler_quantum_floor_apply,
     /* .reset             = */ llama_sampler_quantum_floor_reset,
     /* .clone             = */ llama_sampler_quantum_floor_clone,
@@ -593,9 +575,6 @@ llama_sampler * llama_sampler_init_quantum_floor(const quantum_floor_params & pa
     if (floor_reserved > QUANTUM_FLOOR_M) {
         throw std::runtime_error("quantum_floor: K * n_vocab exceeds the 2^32 address space");
     }
-    if (params.buffer_size <= 0) {
-        throw std::runtime_error("quantum_floor: buffer_size must be positive");
-    }
     if (params.recv_timeout_ms <= 0) {
         throw std::runtime_error("quantum_floor: recv_timeout_ms must be positive");
     }
@@ -604,7 +583,6 @@ llama_sampler * llama_sampler_init_quantum_floor(const quantum_floor_params & pa
     ctx->params = params;
     ctx->n_vocab = n_vocab;
     ctx->rows = quantum_floor_compute_G_rows();
-    ctx->ring.resize((size_t) params.buffer_size);
 
     if (floor_reserved > (1ULL << 31)) {
         const double pct = 100.0 * (double) floor_reserved / (double) QUANTUM_FLOOR_M;
@@ -621,7 +599,6 @@ llama_sampler * llama_sampler_init_quantum_floor(const quantum_floor_params & pa
     try {
         ctx->sock = quantum_floor_connect_tcp(params.qrng_host, params.qrng_port);
         quantum_floor_log(ctx, "INFO", string_format("connected to QRNG Lever stream at %s:%d", params.qrng_host.c_str(), params.qrng_port));
-        ctx->reader = std::thread(quantum_floor_reader_main, ctx);
     } catch (...) {
         delete ctx;
         throw;
