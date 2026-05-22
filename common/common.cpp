@@ -1243,15 +1243,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     //}
 
     // init the backend samplers as part of the context creation
-    pimpl->samplers.resize(cparams.n_seq_max);
-    pimpl->samplers_seq_config.resize(cparams.n_seq_max);
-
-    for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
-        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
-        pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
-    }
-
     if (params.sampling.backend_sampling) {
+        pimpl->samplers.resize(cparams.n_seq_max);
+        pimpl->samplers_seq_config.resize(cparams.n_seq_max);
+
+        for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+            pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
+            pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+        }
+
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }

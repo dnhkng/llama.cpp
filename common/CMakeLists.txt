@@ -100,6 +100,8 @@ add_library(${TARGET}
     regex-partial.h
     sampling.cpp
     sampling.h
+    sampling-quantum.cpp
+    sampling-quantum.h
     speculative.cpp
     speculative.h
     unicode.cpp

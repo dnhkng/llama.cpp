@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "sampling-quantum.h"
 
 #include "ggml.h"
 
@@ -186,6 +187,7 @@ std::string common_params_sampling::print() const {
 
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -311,6 +313,39 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));
     }
 
+    const bool use_quantum_floor = !params.quantum_floor.qrng_host.empty();
+
+    if (use_quantum_floor) {
+        if (params.mirostat != 0) {
+            throw std::runtime_error("quantum_floor sampler requires full vocabulary; remove truncation samplers from the chain");
+        }
+        if (params.temp <= 0.0f || params.temp - params.dynatemp_range <= 0.0f) {
+            throw std::runtime_error("quantum_floor sampler requires non-greedy temperature settings; use --temp > 0 and keep dynamic temperature above 0");
+        }
+        if (!params.grammar.empty()) {
+            throw std::runtime_error("quantum_floor sampler requires full vocabulary; grammar constraints are not compatible");
+        }
+        if (params.ignore_eos) {
+            throw std::runtime_error("quantum_floor sampler requires full vocabulary; --ignore-eos is not compatible");
+        }
+        for (const auto & cnstr : params.samplers) {
+            switch (cnstr) {
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                case COMMON_SAMPLER_TYPE_XTC:
+                case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                case COMMON_SAMPLER_TYPE_INFILL:
+                case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                    throw std::runtime_error("quantum_floor sampler requires full vocabulary; remove truncation samplers from the chain");
+                default:
+                    break;
+            }
+        }
+        params.backend_sampling = false;
+    }
+
     if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
@@ -365,7 +400,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                     GGML_ASSERT(false && "unknown sampler type");
             }
         }
-        if (use_adaptive_p) {
+        if (use_quantum_floor) {
+            samplers.push_back(llama_sampler_init_quantum_floor(params.quantum_floor, n_vocab));
+        } else if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {

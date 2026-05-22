@@ -80,6 +80,13 @@ json task_params::to_json(bool only_metrics) const {
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
+            {"quantum_qrng_host",         sampling.quantum_floor.qrng_host},
+            {"quantum_qrng_port",         sampling.quantum_floor.qrng_port},
+            {"quantum_k",                 sampling.quantum_floor.K},
+            {"quantum_buffer_size",       sampling.quantum_floor.buffer_size},
+            {"quantum_recv_timeout",      sampling.quantum_floor.recv_timeout_ms},
+            {"quantum_log",               sampling.quantum_floor.log_path},
+            {"quantum_debug_tax",         sampling.quantum_floor.debug_tax},
             {"lora",                      lora},
         };
     }
@@ -137,6 +144,13 @@ json task_params::to_json(bool only_metrics) const {
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
+        {"quantum_qrng_host",         sampling.quantum_floor.qrng_host},
+        {"quantum_qrng_port",         sampling.quantum_floor.qrng_port},
+        {"quantum_k",                 sampling.quantum_floor.K},
+        {"quantum_buffer_size",       sampling.quantum_floor.buffer_size},
+        {"quantum_recv_timeout",      sampling.quantum_floor.recv_timeout_ms},
+        {"quantum_log",               sampling.quantum_floor.log_path},
+        {"quantum_debug_tax",         sampling.quantum_floor.debug_tax},
         {"lora",                      lora},
     };
 }
@@ -303,6 +317,13 @@ task_params server_task::params_from_json_cmpl(
     params.sampling.n_probs            = json_value(data, "n_probs",             defaults.sampling.n_probs);
     params.sampling.min_keep           = json_value(data, "min_keep",            defaults.sampling.min_keep);
     params.sampling.backend_sampling   = json_value(data, "backend_sampling",    defaults.sampling.backend_sampling);
+    params.sampling.quantum_floor.qrng_host       = json_value(data, "quantum_qrng_host",    defaults.sampling.quantum_floor.qrng_host);
+    params.sampling.quantum_floor.qrng_port       = json_value(data, "quantum_qrng_port",    defaults.sampling.quantum_floor.qrng_port);
+    params.sampling.quantum_floor.K               = json_value(data, "quantum_k",            defaults.sampling.quantum_floor.K);
+    params.sampling.quantum_floor.buffer_size     = json_value(data, "quantum_buffer_size",  defaults.sampling.quantum_floor.buffer_size);
+    params.sampling.quantum_floor.recv_timeout_ms = json_value(data, "quantum_recv_timeout", defaults.sampling.quantum_floor.recv_timeout_ms);
+    params.sampling.quantum_floor.log_path        = json_value(data, "quantum_log",          defaults.sampling.quantum_floor.log_path);
+    params.sampling.quantum_floor.debug_tax       = json_value(data, "quantum_debug_tax",    defaults.sampling.quantum_floor.debug_tax);
     params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
 
     params.speculative = defaults.speculative;

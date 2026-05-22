@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "sampling-quantum.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -239,6 +240,7 @@ struct common_params_sampling {
     bool    ignore_eos         = false;
     bool    no_perf            = false;  // disable performance metrics
     bool    timing_per_token   = false;
+    quantum_floor_params quantum_floor;
 
     uint64_t user_sampling_config = 0; // bitfield to track user-specified samplers
 

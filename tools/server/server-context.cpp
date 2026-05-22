@@ -3181,7 +3181,15 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                llama_token id = LLAMA_TOKEN_NULL;
+                try {
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                } catch (const std::exception & e) {
+                    send_error(slot, e.what());
+                    slot.release();
+                    slot.prompt_clear(false);
+                    continue;
+                }
 
                 slot.i_batch = -1;
 
@@ -3239,7 +3247,15 @@ private:
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    std::vector<llama_token> accepted;
+                    try {
+                        accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    } catch (const std::exception & e) {
+                        send_error(slot, e.what());
+                        slot.release();
+                        slot.prompt_clear(false);
+                        continue;
+                    }
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);

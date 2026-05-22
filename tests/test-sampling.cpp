@@ -1,14 +1,29 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling-quantum.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
+#include <numeric>
+#include <random>
+#include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <atomic>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 extern struct llama_sampler * llama_sampler_init_dry_testing(int32_t context_size, float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const std::vector<std::vector<llama_token>>& seq_breakers);
 
@@ -71,6 +86,151 @@ static void test_temp(const std::vector<float> & probs, const std::vector<float>
 
     tester.check();
 }
+
+static void test_quantum_floor_spreader() {
+    const auto rows = quantum_floor_compute_G_rows();
+    GGML_ASSERT(rows.size() == 32);
+    GGML_ASSERT(__builtin_popcount(rows[0]) == 31);
+    GGML_ASSERT(rows[0] == 0xfffffffeu);
+
+    int n_w31 = 0;
+    int n_w17 = 0;
+    int n_w15 = 0;
+    for (const auto row : rows) {
+        const int w = __builtin_popcount(row);
+        n_w31 += w == 31;
+        n_w17 += w == 17;
+        n_w15 += w == 15;
+    }
+    GGML_ASSERT(n_w31 == 1);
+    GGML_ASSERT(n_w17 == 16);
+    GGML_ASSERT(n_w15 == 15);
+
+    std::mt19937 rng(12345);
+    for (int i = 0; i < 10000; ++i) {
+        const uint32_t u = rng();
+        GGML_ASSERT(quantum_floor_spread(quantum_floor_spread(u, rows), rows) == u);
+    }
+
+    std::unordered_set<uint32_t> seen;
+    seen.reserve(1u << 20);
+    for (uint32_t u = 0; u < (1u << 20); ++u) {
+        const uint32_t y = quantum_floor_spread(u, rows);
+        GGML_ASSERT(seen.insert(y).second);
+    }
+}
+
+static void test_quantum_floor_allocation() {
+    const std::vector<double> probs = {
+        0.50,
+        0.25,
+        0.125,
+        0.12499996,
+        1.0e-8,
+        3.0e-8,
+    };
+    const auto alloc = quantum_floor_build_allocation(probs, 64);
+    GGML_ASSERT(alloc.slots.size() == probs.size());
+    GGML_ASSERT(alloc.cdf.size() == probs.size());
+    GGML_ASSERT(std::accumulate(alloc.slots.begin(), alloc.slots.end(), uint64_t(0)) == (1ULL << 32));
+    GGML_ASSERT(alloc.cdf.back() == ((1ULL << 32) - 1));
+    GGML_ASSERT(alloc.slots[4] == 64);
+
+    const double r0 = (double) alloc.slots[0] / std::floor(probs[0] * (double) (1ULL << 32));
+    const double r1 = (double) alloc.slots[1] / std::floor(probs[1] * (double) (1ULL << 32));
+    const double r2 = (double) alloc.slots[2] / std::floor(probs[2] * (double) (1ULL << 32));
+    GGML_ASSERT(std::fabs(r0 - r1) < 1e-6);
+    GGML_ASSERT(std::fabs(r0 - r2) < 1e-6);
+}
+
+static void test_quantum_floor_k_validation() {
+    quantum_floor_params params;
+    params.qrng_host = "127.0.0.1";
+
+    params.K = 0;
+    try {
+        llama_sampler_free(llama_sampler_init_quantum_floor(params, 10));
+        GGML_ABORT("quantum_floor K=0 should fail");
+    } catch (const std::runtime_error & e) {
+        GGML_ASSERT(std::string(e.what()) == "quantum_floor: K must be >= 1");
+    }
+
+    params.K = (1 << 20) + 1;
+    try {
+        llama_sampler_free(llama_sampler_init_quantum_floor(params, 10));
+        GGML_ABORT("quantum_floor K > 2^20 should fail");
+    } catch (const std::runtime_error & e) {
+        GGML_ASSERT(std::string(e.what()) == "quantum_floor: K must be <= 2^20; current value would consume most of the address space");
+    }
+}
+
+#ifndef _WIN32
+static void test_quantum_floor_mock_qrng() {
+    const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    GGML_ASSERT(listen_fd >= 0);
+
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    GGML_ASSERT(bind(listen_fd, (sockaddr *) &addr, sizeof(addr)) == 0);
+    GGML_ASSERT(listen(listen_fd, 1) == 0);
+
+    socklen_t addr_len = sizeof(addr);
+    GGML_ASSERT(getsockname(listen_fd, (sockaddr *) &addr, &addr_len) == 0);
+    const int port = ntohs(addr.sin_port);
+
+    std::atomic<bool> stop{false};
+    std::thread server([&] {
+        const int client_fd = accept(listen_fd, nullptr, nullptr);
+        if (client_fd < 0) {
+            return;
+        }
+        uint8_t buf[256];
+        for (int i = 0; i < 256; ++i) {
+            buf[i] = (uint8_t) i;
+        }
+        while (!stop.load()) {
+            if (send(client_fd, buf, sizeof(buf), MSG_NOSIGNAL) <= 0) {
+                break;
+            }
+        }
+        close(client_fd);
+    });
+
+    quantum_floor_params params;
+    params.qrng_host = "127.0.0.1";
+    params.qrng_port = port;
+    params.K = 64;
+    params.buffer_size = 8;
+    params.recv_timeout_ms = 1000;
+
+    llama_sampler * sampler = llama_sampler_init_quantum_floor(params, 4);
+
+    std::vector<llama_token_data> cur = {
+        { 0, logf(0.10f), 0.0f },
+        { 1, logf(0.20f), 0.0f },
+        { 2, logf(0.30f), 0.0f },
+        { 3, logf(0.40f), 0.0f },
+    };
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(sampler, &cur_p);
+    GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int32_t) cur.size());
+
+    double p_sum = 0.0;
+    for (const auto & data : cur) {
+        p_sum += data.p;
+    }
+    GGML_ASSERT(std::fabs(p_sum - 1.0) < 1e-6);
+
+    stop = true;
+    llama_sampler_free(sampler);
+    shutdown(listen_fd, SHUT_RDWR);
+    close(listen_fd);
+    server.join();
+}
+#endif
 
 static void test_temp_ext(const std::vector<float> & probs, const std::vector<float> & probs_expected, float temp, float delta, float exponent) {
     sampler_tester tester(probs, probs_expected);
@@ -307,6 +467,13 @@ static void test_perf() {
 
 int main(void) {
     ggml_time_init();
+
+    test_quantum_floor_spreader();
+    test_quantum_floor_allocation();
+    test_quantum_floor_k_validation();
+#ifndef _WIN32
+    test_quantum_floor_mock_qrng();
+#endif
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

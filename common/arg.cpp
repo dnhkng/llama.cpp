@@ -1924,6 +1924,55 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--quantum-qrng-host"}, "HOST",
+        "enable quantum_floor sampling using raw QRNG bytes from HOST (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.quantum_floor.qrng_host = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--quantum-qrng-port"}, "PORT",
+        string_format("QRNG raw Lever TCP port for quantum_floor sampling (default: %d)", params.sampling.quantum_floor.qrng_port),
+        [](common_params & params, int value) {
+            params.sampling.quantum_floor.qrng_port = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--quantum-k"}, "K",
+        string_format("quantum_floor minimum integer-CDF slots per token (default: %d)", params.sampling.quantum_floor.K),
+        [](common_params & params, int value) {
+            params.sampling.quantum_floor.K = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--quantum-buffer-size"}, "N",
+        string_format("quantum_floor QRNG ring buffer depth in uint32 words (default: %d)", params.sampling.quantum_floor.buffer_size),
+        [](common_params & params, int value) {
+            params.sampling.quantum_floor.buffer_size = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--quantum-recv-timeout"}, "MS",
+        string_format("quantum_floor per-token QRNG wait timeout in milliseconds (default: %d)", params.sampling.quantum_floor.recv_timeout_ms),
+        [](common_params & params, int value) {
+            params.sampling.quantum_floor.recv_timeout_ms = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--quantum-log"}, "PATH",
+        "write quantum_floor diagnostics to PATH instead of stderr",
+        [](common_params & params, const std::string & value) {
+            params.sampling.quantum_floor.log_path = value;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--quantum-debug-tax"},
+        "log quantum_floor multiverse-tax diagnostic on the first sample after each sampler reset (default: disabled)",
+        [](common_params & params) {
+            params.sampling.quantum_floor.debug_tax = true;
+        }
+    ).set_sampling().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {
