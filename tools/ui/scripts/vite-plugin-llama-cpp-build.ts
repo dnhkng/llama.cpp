@@ -19,7 +19,7 @@ const GUIDE_FOR_FRONTEND = `
 -->
 `.trim();
 
-const OUTPUT_DIR = '../../build/tools/ui/dist';
+const OUTPUT_DIR = process.env.LLAMA_UI_OUT_DIR ?? './dist';
 
 export function llamaCppBuildPlugin(): Plugin {
 	return {
@@ -46,10 +46,12 @@ export function llamaCppBuildPlugin(): Plugin {
 
 					content = content.replace(/\r/g, '');
 					content = GUIDE_FOR_FRONTEND + '\n' + content;
-					content = content.replace(/\/_app\/immutable\/bundle\.[^"]+\.js/g, './bundle.js');
+
+					// Keep the Vite hash as a query string so each build busts the browser cache
+					content = content.replace(/\/_app\/immutable\/bundle\.([^".]+)\.js/g, './bundle.js?$1');
 					content = content.replace(
-						/\/_app\/immutable\/assets\/bundle\.[^"]+\.css/g,
-						'./bundle.css'
+						/\/_app\/immutable\/assets\/bundle\.([^".]+)\.css/g,
+						'./bundle.css?$1'
 					);
 					content = content.replace(/__sveltekit_[a-z0-9]+/g, '__sveltekit__');
 
